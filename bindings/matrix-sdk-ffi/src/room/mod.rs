@@ -38,6 +38,7 @@ use ruma::{
     ServerName, UserId, assign,
     events::{
         AnyMessageLikeEventContent, AnySyncTimelineEvent,
+        StateEventType,
         receipt::ReceiptThread,
         room::{
             MediaSource as RumaMediaSource, avatar::ImageInfo as RumaAvatarImageInfo,
@@ -467,6 +468,55 @@ impl Room {
             self.inner.send_state_event_raw(&event_type, &state_key, content_json).await?;
 
         Ok(response.event_id.to_string())
+    }
+
+    /// Returns all room state events of the given type, reading from the local
+    /// state cache (no network request).
+    ///
+    /// Each entry in the returned list corresponds to one state key (e.g. one
+    /// bot publishing `m.room.bot.options` events uses its Matrix user ID as
+    /// the state key, so multiple bots each appear as a separate entry).
+    ///
+    /// Returns an empty list if no events of that type are present.
+    ///
+    /// # Arguments
+    ///
+    /// * `event_type` - The Matrix event type, e.g. `"m.room.bot.options"`.
+    pub async fn get_state_events_raw(
+        &self,
+        event_type: String,
+    ) -> Result<Vec<RoomStateEventRaw>, ClientError> {
+        let event_type: StateEventType = event_type.as_str().into();
+        let raw_events = self.inner.get_state_events(event_type).await?;
+        raw_events
+            .into_iter()
+            .map(|raw_event| {
+                let json_str = match &raw_event {
+                    matrix_sdk::deserialized_responses::RawAnySyncOrStrippedState::Sync(r) => {
+                        r.json().get()
+                    }
+                    matrix_sdk::deserialized_responses::RawAnySyncOrStrippedState::Stripped(r) => {
+                        r.json().get()
+                    }
+                };
+                let full: serde_json::Value =
+                    serde_json::from_str(json_str).map_err(|e| ClientError::Generic {
+                        msg: format!("Failed to parse state event JSON: {e}"),
+                        details: Some(format!("{e:?}")),
+                    })?;
+                let state_key = full
+                    .get("state_key")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_owned();
+                let content = full
+                    .get("content")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Object(Default::default()))
+                    .to_string();
+                Ok(RoomStateEventRaw { state_key, content })
+            })
+            .collect()
     }
 
     /// Redacts an event from the room.
@@ -1396,6 +1446,15 @@ impl RoomMembersIterator {
 }
 
 /// Information about a member considered to be a room hero.
+/// A room state event returned as raw JSON, as used by [`Room::get_state_events_raw`].
+#[derive(uniffi::Record)]
+pub struct RoomStateEventRaw {
+    /// The state key of the event (e.g. a Matrix user ID, or `""` for singleton events).
+    pub state_key: String,
+    /// The `"content"` object of the state event serialised as a JSON string.
+    pub content: String,
+}
+
 #[derive(uniffi::Record)]
 pub struct RoomHero {
     /// The user ID of the hero.
